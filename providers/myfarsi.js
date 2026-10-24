@@ -27,7 +27,7 @@ var CONFIG = {
   // search = optional: the site's search URL if you know it ({q} = the title)
   SITES: [
     { name: "MyFarsi", url: "https://negahestan.com" }
-    { name: 'MyFarsi 2', url: "https://www.diycraftsguide.com/safeasli" },
+    { name: 'MyFarsi 2', url: "https://www.diycraftsguide.com" },
   ],
   PROVIDER_NAME: "MyFarsi",
   TMDB_API_KEY: "570e659354bbb65a671cd0f627f65aab",
