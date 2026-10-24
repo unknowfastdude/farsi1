@@ -26,7 +26,7 @@ var CONFIG = {
   // url    = site address, no trailing slash
   // search = optional: the site's search URL if you know it ({q} = the title)
   SITES: [
-    { name: "MyFarsi", url: "https://negahestan.com/index.html?nq1ZJwNPMU3LiNV5zzXv" }
+    { name: "MyFarsi", url: "https://negahestan.com" }
     // { name: 'MyFarsi 2', url: 'https://second-site.com', search: '/find?term={q}' },
   ],
   PROVIDER_NAME: "MyFarsi",
