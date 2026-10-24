@@ -1,0 +1,21 @@
+{
+  "name": "MyFarsi Providers",
+  "version": "1.1.0",
+  "description": "Streams from my licensed Persian movie and series site",
+  "author": "You",
+  "scrapers": [
+    {
+      "id": "myfarsi",
+      "name": "MyFarsi",
+      "description": "Adaptive scraper for my licensed Persian movie and series site",
+      "version": "1.1.0",
+      "author": "You",
+      "supportedTypes": ["movie", "tv"],
+      "filename": "providers/myfarsi.js",
+      "enabled": true,
+      "logo": "https://YOUR-SITE.com/logo.png",
+      "contentLanguage": ["fa"],
+      "formats": ["m3u8", "mp4"]
+    }
+  ]
+}

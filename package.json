@@ -1,0 +1,13 @@
+{
+  "name": "myfarsi-nuvio-plugin",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Adaptive HTML scraper provider for Nuvio, for my own licensed site",
+  "scripts": {
+    "build": "esbuild src/myfarsi.js --bundle --platform=neutral --format=cjs --target=es2016 --outfile=providers/myfarsi.js",
+    "test": "npm run build && node test/run-tests.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
