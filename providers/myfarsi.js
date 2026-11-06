@@ -50,6 +50,10 @@ var CONFIG = {
   MAX_FETCHES: 30,
   // per lookup, keeps it fast
   TIMEOUT_MS: 9e3,
+  // Per-stream reachability probe cap (ms). Probes run on-device so they reflect
+  // the playback network exactly; dead/geo-locked mirrors get dropped instead of
+  // leaving Nuvio buffering forever.
+  PROBE_MS: 2500,
   USER_AGENT: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 };
 var LEARNED = {};
@@ -273,7 +277,7 @@ function slugText(u) {
   return (meaningful.join(" ") || "").replace(/\.(html?|php|aspx?)$/i, "").replace(/[-_+.]+/g, " ");
 }
 var NAV_RE = /\/(login|signin|signup|register|account|user|category|categories|tag|tags|genre|genres|contact|contact-us|privacy|dmca|terms|about|language|faq|cart|feed)(\/|\.|$|\?)|\/page\/\d+|[?&](page|lang)=/i;
-function fetchText(url, ctx, referer) {
+function fetchTextOnce(url, ctx, referer) {
   if (ctx.fetches >= CONFIG.MAX_FETCHES) return Promise.resolve(null);
   ctx.fetches++;
   var headers = {
@@ -301,6 +305,147 @@ function fetchText(url, ctx, referer) {
   return Promise.race([req, timeout]).then(function(r) {
     clearTimeout(timer);
     return r;
+  });
+}
+function fetchText(url, ctx, referer) {
+  return fetchTextOnce(url, ctx, referer).then(function(res) {
+    if (!res) return res;
+    // Some sites bounce requests across their own hosts and DROP the query
+    // string along the way (seen: mobile.namakade.com:8443/search?... ->
+    // namakade.com/search with no params). If we landed somewhere else
+    // without our params, retry once with them re-appended to the final path.
+    var oq = String(url).split("?")[1];
+    var finalUrl = String(res.url || url);
+    var origPath = String(url).split("?")[0].replace(/\/+$/, "");
+    var finalPath = finalUrl.split("?")[0].replace(/\/+$/, "");
+    if (oq && finalUrl.indexOf("?") === -1 && finalPath !== origPath) {
+      return fetchTextOnce(finalPath + "?" + oq, ctx, referer);
+    }
+    return res;
+  });
+}
+function probeStream(url, referer, useRef) {
+  var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  var done = false;
+  var timer = setTimeout(function() {
+    if (!done && controller) { try { controller.abort(); } catch (e) {} }
+  }, CONFIG.PROBE_MS);
+  var headers = { "User-Agent": CONFIG.USER_AGENT, "Range": "bytes=0-255" };
+  if (referer && useRef !== false) {
+    headers.Referer = referer;
+    var og = originOf(referer);
+    if (og) headers.Origin = og;
+  }
+  return fetch(url, { headers, signal: controller ? controller.signal : void 0 }).then(function(res) {
+    var ok = res.status >= 200 && res.status < 400;
+    var ct = "";
+    try { ct = (res.headers.get("content-type") || "").toLowerCase(); } catch (e2) {}
+    // a challenge/error page is not a playable stream
+    if (ok && /^text\/html/i.test(ct)) ok = false;
+    if (controller) { try { controller.abort(); } catch (e3) {} }
+    return ok;
+  }).catch(function() {
+    return false;
+  }).then(function(ok) {
+    done = true;
+    clearTimeout(timer);
+    return ok;
+  });
+}
+// namakade-style CDNs store whole series as <Prefix>_S<ss>_E<ee>.mp4 even when
+// the site only PAGES some seasons (e.g. Bamdad-e Khomar: site lists S2 only,
+// but Bamdade_Khomar_S1_E01.mp4 exists on media.negahestan.com). Learning the
+// prefix from any real episode page lets us fill the unlisted seasons.
+function learnCdnHint(ctx, html) {
+  if (!ctx.learned || !html) return;
+  var m = String(html).match(/id="videoTagSrc"[^>]*?src\s*=\s*["']([^"']+)["']/i);
+  if (!m) return;
+  var file = m[1].split("?")[0].split("/").pop();
+  var pm = file.match(/^(.+)_S(\d{1,2})_E(\d{1,4})\.(?:mp4|m3u8|mkv)$/i);
+  if (!pm) return;
+  var dir = m[1].split("?")[0].replace(/[^\/]*$/, "");
+  var dirs = [dir];
+  var nm = dir.match(/^(https?:\/\/[^\/]+)\/ipnx\/media\/(.+)$/i);
+  if (nm) {
+    // namakade's second CDN shape (Wowza-style path); reachability is decided
+    // by the on-device probe, so adding it is free.
+    dirs.push(nm[1] + "/vod/mp4:" + nm[2]);
+    dirs.push(nm[1].replace(/media\.negahestan\.com/i, "media.iranproud2.net") + "/ipnx/media/" + nm[2]);
+  }
+  if (!ctx.learned.cdnHint) {
+    ctx.learned.cdnHint = { prefix: pm[1], sLen: pm[2].length, eLen: pm[3].length, dirs: dirs };
+    console.log("[cdn-hint] learned prefix '" + pm[1] + "' from " + file);
+  }
+}
+function cdnConstructStreams(info, ctx) {
+  var hint = ctx.learned && ctx.learned.cdnHint;
+  if (!hint || info.type !== "tv") return [];
+  function pad(n, len) {
+    var str = "" + n;
+    if (len > 1 && str.length < len) str = new Array(len - str.length + 1).join("0") + str;
+    return str;
+  }
+  var s = +info.season || 1, e = +info.episode || 1;
+  var sVs = [pad(s, hint.sLen || 1), "" + s], eVs = [pad(e, hint.eLen || 1), "" + e];
+  var out = [], seen = {};
+  (hint.dirs || []).forEach(function(dir) {
+    sVs.forEach(function(sv) {
+      eVs.forEach(function(ev) {
+        var u = dir + hint.prefix + "_S" + sv + "_E" + ev + ".mp4";
+        if (!seen[u]) { seen[u] = 1; out.push({ url: u, quality: "Auto", referer: ctx.site.url + "/" }); }
+      });
+    });
+  });
+  return out;
+}
+function farsicdnVariants(u) {
+  var m = String(u).match(/^(https?:\/\/)s(\d+)\.farsicdn\.site(\/.*)$/i);
+  if (!m) return [u];
+  var out = [u];
+  ["1", "2", "3"].forEach(function(n) {
+    if (n === m[2]) return;
+    var v = m[1] + "s" + n + ".farsicdn.site" + m[3];
+    if (out.indexOf(v) === -1) out.push(v);
+  });
+  return out;
+}
+function verifyStreams(media) {
+  return Promise.all(media.map(function(x) {
+    return __async(this, null, function* () {
+      // Sources whose delivery is TLS-fingerprint gated (Dailymotion cdndirector
+      // 403s node/curl handshakes but serves real device players) must not be
+      // probed with fetch() — a probe 403 there does not mean the player fails.
+      if (x.skipProbe) {
+        // Soft-probe TLS-gated sources (e.g. Dailymotion cdndirector): a 200
+        // from the device network proves reachability; a 403/timeout is
+        // inconclusive for the real player (JA3 gate), so KEEP the stream but
+        // demote it below probe-verified ones instead of ever dropping it.
+        var softOk = yield probeStream(x.url, x.referer, true);
+        if (softOk) x.softVerified = true;
+        else console.log("[probe] soft-fail (kept, demoted): " + x.url);
+        return x;
+      }
+      var variants = farsicdnVariants(x.url);
+      for (var i = 0; i < variants.length; i++) {
+        var ok = yield probeStream(variants[i], x.referer, true);
+        if (!ok && x.referer) {
+          // Some CDNs (media.negahestan.com) 404 ANY request carrying a
+          // Referer — even their own site's pages. Retry bare before giving
+          // up, and remember so the player also gets Referer-free headers.
+          ok = yield probeStream(variants[i], null, false);
+          if (ok) x.noReferer = true;
+        }
+        if (ok) {
+          if (i) console.log("[probe] dead source replaced: " + x.url + " -> " + variants[i]);
+          x.url = variants[i];
+          return x;
+        }
+      }
+      console.log("[probe] unreachable, dropped: " + x.url);
+      return null;
+    });
+  })).then(function(list) {
+    return list.filter(Boolean);
   });
 }
 function getTitleInfo(tmdbId, type) {
@@ -362,9 +507,17 @@ function extractLinks(html, base) {
   while (m = re.exec(html)) {
     var inner = m[2];
     var alt = (inner.match(/\balt\s*=\s*["']([^"']+)["']/i) || [])[1] || "";
+    var txt = [stripTags(inner), attr(m[1], "title"), alt].filter(Boolean).join(" ");
+    if (!txt) {
+      // Thumbnail-card catalogs (namakade /best-serial et al.) render anchors
+      // as bare <img> with no text — the thumb FILENAME is often the only
+      // name signal (".../thumbs/Bamdade_Khomar_smallthumb.jpg").
+      var im2 = inner.match(/<img[^>]*\bsrc\s*=\s*["']([^"']+)["']/i);
+      if (im2) txt = im2[1].split("?")[0].split("/").pop().replace(/\.(jpg|jpeg|png|webp|gif)$/i, "").replace(/_(small|smallthumb|thumb|med|medium|large)$/i, "").replace(/[-_+.]+/g, " ");
+    }
     push(
       attr(m[1], "href") || attr(m[1], "data-href") || attr(m[1], "data-url"),
-      [stripTags(inner), attr(m[1], "title"), alt].filter(Boolean).join(" ")
+      txt
     );
   }
   re = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
@@ -434,6 +587,202 @@ function episodeScore(text, s, e) {
   if (seasons.length) return seasons.indexOf(+s) !== -1 ? 1 : 0;
   return +s === 1 ? 0.9 : 0.6;
 }
+var FA_ORDINALS = { "\u0627\u0648\u0644": 1, "\u062F\u0648\u0645": 2, "\u0633\u0648\u0645": 3, "\u0686\u0647\u0627\u0631\u0645": 4, "\u067E\u0646\u062C\u0645": 5, "\u0634\u0634\u0645": 6, "\u0647\u0641\u062A\u0645": 7, "\u0647\u0634\u062A\u0645": 8, "\u0646\u0647\u0645": 9, "\u062F\u0647\u0645": 10, "\u06CC\u0627\u0632\u062F\u0647\u0645": 11, "\u062F\u0648\u0627\u0632\u062F\u0647\u0645": 12, "\u0633\u06CC\u0632\u062F\u0647\u0645": 13, "\u0686\u0647\u0627\u0631\u062F\u0647\u0645": 14, "\u067E\u0627\u0646\u0632\u062F\u0647\u0645": 15, "\u0634\u0627\u0646\u0632\u062F\u0647\u0645": 16, "\u0647\u0641\u062F\u0647\u0645": 17, "\u0647\u062C\u062F\u0647\u0645": 18, "\u0646\u0648\u0632\u062F\u0647\u0645": 19, "\u0628\u06CC\u0633\u062A\u0645": 20 };
+var FA_ORD_RE = "\u0627\u0648\u0644|\u062F\u0648\u0645|\u0633\u0648\u0645|\u0686\u0647\u0627\u0631\u0645|\u067E\u0646\u062C\u0645|\u0634\u0634\u0645|\u0647\u0641\u062A\u0645|\u0647\u0634\u062A\u0645|\u0646\u0647\u0645|\u062F\u0647\u0645|\u06CC\u0627\u0632\u062F\u0647\u0645|\u062F\u0648\u0627\u0632\u062F\u0647\u0645|\u0633\u06CC\u0632\u062F\u0647\u0645|\u0686\u0647\u0627\u0631\u062F\u0647\u0645|\u067E\u0627\u0646\u0632\u062F\u0647\u0645|\u0634\u0627\u0646\u0632\u062F\u0647\u0645|\u0647\u0641\u062F\u0647\u0645|\u0647\u062C\u062F\u0647\u0645|\u0646\u0648\u0632\u062F\u0647\u0645|\u0628\u06CC\u0633\u062A\u0645";
+function ordinalsEpisodeScore(text, s, e) {
+  // Full digit + Persian-ordinal-word parser. Catalogs mix forms:
+  // "بامداد خمار فصل دوم قسمت 1" (word season + digit episode) must score 0
+  // for S1E1 — so word seasons matter even when the episode number is a digit.
+  var t = " " + latinDigits(decodeEntities(text)).toLowerCase().replace(/[_\-.\/|,]+/g, " ") + " ";
+  var seasons = [];
+  var mm;
+  var seasonRe = /(?:^|[^a-z\u0600-\u06ff])(?:season|fasl|fasle|s|\u0641\u0635\u0644)\s*0*(\d{1,2})(?!\d)/g;
+  while (mm = seasonRe.exec(t)) seasons.push(+mm[1]);
+  var wsm = t.match(new RegExp("\u0641\u0635\u0644\\s*(" + FA_ORD_RE + ")"));
+  if (wsm) seasons.push(FA_ORDINALS[wsm[1]]);
+  var eps = [];
+  var epRe = /(?:^|[^a-z\u0600-\u06ff])(?:episode|epsiode|episod|epi|ep|e|qesmat|ghesmat|part|\u0642\u0633\u0645\u062A|\u0628\u062E\u0634)\s*0*(\d{1,4})(?!\d)/g;
+  while (mm = epRe.exec(t)) eps.push(+mm[1]);
+  var wom = t.match(new RegExp("(?:\u0642\u0633\u0645\u062A|\u0628\u062E\u0634)\\s*(" + FA_ORD_RE + ")"));
+  if (wom) eps.push(FA_ORDINALS[wom[1]]);
+  if (!eps.length) return episodeScore(text, s, e);
+  if (eps.indexOf(+e) === -1) return 0;
+  if (seasons.length) return seasons.indexOf(+s) !== -1 ? 1 : 0;
+  // No season marker in title: safe bet for season 1, but for s>1 a
+  // season-less title is usually the bare/first-season upload — do not match.
+  return +s === 1 ? 0.9 : 0.4;
+}
+// Video-search results that are never an episode of a series (novel
+// audiobooks named after the show, songs, teasers, reviews).
+var NON_EPISODE_RE = /\u0631\u0645\u0627\u0646|\u0635\u0648\u062A\u06CC|\u0622\u0647\u0646\u06AF|\u0645\u0648\u0633\u06CC\u0642\u06CC|\u062A\u06CC\u0632\u0631|\u062A\u0631\u06CC\u0644\u0631|\u0646\u0642\u062F|\u0628\u0631\u0631\u0633\u06CC|\u0645\u0639\u0631\u0641\u06CC|\u067E\u0634\u062A\s*\u0635\u062D\u0646\u0647|\u0645\u0635\u0627\u062D\u0628\u0647/;
+function isNonEpisodeTitle(t) {
+  return NON_EPISODE_RE.test(String(t || ""));
+}
+function episodeScoreAny(text, s, e) {
+  // ordinalsEpisodeScore fully subsumes episodeScore (digits + Persian ordinal
+  // words, word seasons); it delegates to episodeScore only when its own
+  // regexes find no episode marker at all. Do NOT max() the two — the legacy
+  // scorer misses word-seasons ("فصل دوم") and would re-admit wrong seasons.
+  return ordinalsEpisodeScore(text, s, e);
+}
+function faNameOf(info) {
+  for (var i = 0; i < info.names.length; i++) if (/[\u0600-\u06FF]/.test(info.names[i])) return info.names[i];
+  return info.names[0] || "";
+}
+function fetchJson(url, ctx) {
+  return fetchTextOnce(url, ctx).then(function(res) {
+    if (!res || !res.text) return null;
+    try {
+      return JSON.parse(res.text);
+    } catch (e) {
+      return null;
+    }
+  });
+}
+var DAILYMOTION = {
+  SEARCH: "https://api.dailymotion.com/videos?search={q}&fields=id,title,duration&limit=50&page=1",
+  META: "https://www.dailymotion.com/player/metadata/video/{id}?app=com.dailymotion.neon",
+  MIN_TV_SECS: 1200,
+  MIN_MOVIE_SECS: 2400
+};
+function dailymotionSource(info) {
+  return __async(this, null, function* () {
+    var fa = faNameOf(info);
+    if (!fa) return [];
+    var ctx = { fetches: 0 };
+    var minSecs = info.type === "tv" ? DAILYMOTION.MIN_TV_SECS : DAILYMOTION.MIN_MOVIE_SECS;
+    var queries = [];
+    if (info.type === "tv") {
+      queries.push(fa + " \u0642\u0633\u0645\u062A " + info.episode);
+      if (info.season > 1) queries.push(fa + " \u0641\u0635\u0644 " + info.season);
+    }
+    queries.push(fa);
+    var candidates = {}, order = [];
+    for (var qi = 0; qi < queries.length; qi++) {
+      var data = yield fetchJson(DAILYMOTION.SEARCH.replace("{q}", encodeURIComponent(queries[qi])), ctx);
+      var list = data && data.list || [];
+      for (var i = 0; i < list.length; i++) {
+        var v = list[i];
+        if (!v || !v.id || candidates[v.id]) continue;
+        if ((v.duration | 0) < minSecs) continue;
+        if (isNonEpisodeTitle(v.title)) continue;
+        var score = episodeScoreAny(v.title + " " + v.id, info.season, info.episode);
+        if (info.type === "tv" && score < 0.6) continue;
+        candidates[v.id] = { id: v.id, title: v.title || "", score };
+        order.push(v.id);
+      }
+      if (order.length >= 3) break;
+    }
+    if (!order.length) {
+      console.log("[Dailymotion] no full episode found for " + fa);
+      return [];
+    }
+    order.sort(function(a, b) {
+      return candidates[b].score - candidates[a].score;
+    });
+    var out = [];
+    for (var k = 0; k < Math.min(2, order.length); k++) {
+      var meta = yield fetchJson(DAILYMOTION.META.replace("{id}", encodeURIComponent(candidates[order[k]].id)), ctx);
+      if (!meta || meta.error) continue;
+      var q = meta.qualities || {};
+      var m3u8 = "";
+      if (q.auto && q.auto[0] && q.auto[0].url) m3u8 = q.auto[0].url;
+      else {
+        for (var key in q) {
+          if (q[key] && q[key][0] && q[key][0].url) {
+            m3u8 = q[key][0].url;
+            break;
+          }
+        }
+      }
+      if (!m3u8) continue;
+      var qLabel = "Auto";
+      var sf = meta.stream_formats || {};
+      var maxH = 0;
+      for (var h in sf) {
+        var n = parseInt(h, 10);
+        if (n > maxH) maxH = n;
+      }
+      if (maxH) qLabel = maxH >= 2160 ? "4K" : maxH + "p";
+      out.push({
+        url: m3u8,
+        quality: qLabel,
+        site: "Dailymotion",
+        referer: "https://www.dailymotion.com/",
+        skipProbe: true
+      });
+    }
+    console.log("[Dailymotion] " + out.length + " stream(s) for " + info.names[0] + (info.type === "tv" ? " S" + info.season + "E" + info.episode : ""));
+    return out;
+  });
+}
+var APARAT = {
+  SEARCH: "https://www.aparat.com/etc/api/videoBySearch/text/{q}/perpage/30",
+  SHOW: "https://www.aparat.com/api/fa/v1/video/video/show/videohash/{uid}",
+  MIN_TV_SECS: 1200,
+  MIN_MOVIE_SECS: 2400
+};
+function aparatSource(info) {
+  return __async(this, null, function* () {
+    var fa = faNameOf(info);
+    if (!fa) return [];
+    var ctx = { fetches: 0 };
+    var minSecs = info.type === "tv" ? APARAT.MIN_TV_SECS : APARAT.MIN_MOVIE_SECS;
+    var queries = [];
+    if (info.type === "tv") queries.push(fa + " \u0642\u0633\u0645\u062A " + info.episode);
+    queries.push(fa);
+    var candidates = {}, order = [];
+    for (var qi = 0; qi < queries.length; qi++) {
+      var data = yield fetchJson(APARAT.SEARCH.replace("{q}", encodeURIComponent(queries[qi])), ctx);
+      var list = data && data.videobysearch || [];
+      for (var i = 0; i < list.length; i++) {
+        var v = list[i];
+        if (!v || !v.uid || candidates[v.uid]) continue;
+        if ((v.duration | 0) < minSecs) continue;
+        if (isNonEpisodeTitle(v.title)) continue;
+        var score = episodeScoreAny(v.title + " " + (v.uid || ""), info.season, info.episode);
+        if (info.type === "tv" && score < 0.6) continue;
+        candidates[v.uid] = { uid: v.uid, title: v.title || "", score };
+        order.push(v.uid);
+      }
+      if (order.length >= 3) break;
+    }
+    if (!order.length) {
+      console.log("[Aparat] no full episode found for " + fa);
+      return [];
+    }
+    order.sort(function(a, b) {
+      return candidates[b].score - candidates[a].score;
+    });
+    var out = [];
+    for (var k = 0; k < Math.min(2, order.length); k++) {
+      var show = yield fetchJson(APARAT.SHOW.replace("{uid}", encodeURIComponent(candidates[order[k]].uid)), ctx);
+      var attrs = show && show.data && show.data.attributes || null;
+      if (!attrs) continue;
+      var best = null, bestN = -1;
+      var fla = attrs.file_link_all || [];
+      for (var fi = 0; fi < fla.length; fi++) {
+        var u = fla[fi] && fla[fi].urls && fla[fi].urls[0];
+        var n = parseInt(fla[fi] && fla[fi].profile || "0", 10) || 0;
+        if (u && n > bestN) {
+          bestN = n;
+          best = { url: u, quality: n >= 2160 ? "4K" : n + "p" };
+        }
+      }
+      if (!best && attrs.hls_link) best = { url: attrs.hls_link, quality: "Auto" };
+      if (!best && attrs.file_link) best = { url: attrs.file_link, quality: "Auto" };
+      if (!best) continue;
+      out.push({
+        url: best.url,
+        quality: best.quality,
+        site: "Aparat",
+        referer: "https://www.aparat.com/"
+      });
+    }
+    console.log("[Aparat] " + out.length + " stream(s) for " + info.names[0] + (info.type === "tv" ? " S" + info.season + "E" + info.episode : ""));
+    return out;
+  });
+}
 function seasonOnlyScore(text, s) {
   var t = " " + latinDigits(decodeEntities(text)).toLowerCase().replace(/[_\-.\/|]+/g, " ") + " ";
   var re = /(?:^|[^a-z\u0600-\u06ff])(?:season|fasl|fasle|s|فصل)\s*0*(\d{1,2})(?!\d)/g, mm;
@@ -468,6 +817,21 @@ function viaSearch(info, ctx) {
       var noThe = n.replace(/^the\s+/i, "");
       if (noThe !== n && queries.length < 5 && queries.indexOf(noThe) === -1) queries.push(noThe);
     });
+    // Original-language titles (Persian/Arabic) MUST be tried: Iranian sites
+    // index native titles only (e.g. namakade has "بامداد خمار", never
+    // "Drunkard Morning"), and TMDB latin alt-titles don't match LIKE search.
+    // Insert right after the first latin name instead of burying at the end.
+    var insertedOriginal = false;
+    for (var ni = 0; ni < info.names.length && queries.length < 6; ni++) {
+      var on = info.names[ni];
+      if (/[a-z]/i.test(on) || queries.indexOf(on) !== -1) continue;
+      if (!insertedOriginal) {
+        queries.splice(queries.length >= 2 ? 2 : queries.length, 0, on);
+        insertedOriginal = true;
+      } else if (queries.indexOf(on) === -1) {
+        queries.push(on);
+      }
+    }
     info.names.forEach(function(n) {
       if (queries.length < 3 && queries.indexOf(n) === -1) queries.push(n);
     });
@@ -720,6 +1084,7 @@ function findEpisodePage(page, info, ctx) {
           visited[pairs[pi]] = 1;
           var pres = yield fetchText(pairs[pi], ctx, ctx.site.url + "/");
           if (!pres) continue;
+          learnCdnHint(ctx, pres.text);
           var pv = (pres.text.match(/id="videoTagSrc"[^>]*?src\s*=\s*["']([^"]+)["']/i) || [0, ""])[1];
           if (!pv) continue;
           if (new RegExp("0*" + s + "e0*" + e + "([^0-9]|$)", "i").test(pv.replace(/[_\-\s]/g, "").toLowerCase())) return { url: pairs[pi], html: pres.text };
@@ -744,6 +1109,7 @@ function findEpisodePage(page, info, ctx) {
           visited[tryUrl] = 1;
           var eres = yield fetchText(tryUrl, ctx, ctx.site.url + "/");
           if (!eres) continue;
+          learnCdnHint(ctx, eres.text);
           var vsrc = (eres.text.match(/id="videoTagSrc"[^>]*?src\s*=\s*["']([^"']+)["']/i) || [0, ""])[1];
           if (!vsrc) continue;
           var clean = vsrc.replace(/[_\-\s]/g, "").toLowerCase();
@@ -919,6 +1285,14 @@ function streamsFromSite(site, info) {
     } else {
       media = yield streamsFromPage(page.url, ctx, 0);
     }
+    // Season-gap filler: namakade indexes some seasons only (e.g. Bamdad S2)
+    // while their CDN carries the missing ones. The filename convention was
+    // learned from any real episode page — construct + let the probe decide.
+    if (info.type === "tv" && (!media || !media.length)) {
+      var cdn = cdnConstructStreams(info, ctx);
+      if (cdn.length) console.log("[" + site.name + "] cdn-fallback: trying " + cdn.length + " constructed episode url(s)");
+      media = media.concat(cdn);
+    }
     return media.map(function(x) {
       x.site = site.name;
       return x;
@@ -965,7 +1339,23 @@ function getStreamsAsync(tmdbId, mediaType, season, episode) {
         return [];
       });
     }));
+    // Direct-index sources (open JSON APIs, no scraping): Dailymotion carries
+    // full seasons that catalog sites geo-lock, Aparat mirrors current episodes.
+    var extras = yield Promise.all([dailymotionSource(info), aparatSource(info)].map(function(p) {
+      return p.catch(function(err) {
+        console.log("[extra source] error: " + (err && err.message ? err.message : err));
+        return [];
+      });
+    }));
     var media = [], unique = {};
+    extras.forEach(function(list) {
+      list.forEach(function(x) {
+        if (!unique[x.url]) {
+          unique[x.url] = 1;
+          media.push(x);
+        }
+      });
+    });
     results.forEach(function(list) {
       list.forEach(function(x) {
         if (!unique[x.url]) {
@@ -974,8 +1364,16 @@ function getStreamsAsync(tmdbId, mediaType, season, episode) {
         }
       });
     });
+    // Drop mirrors that are dead/geo-locked from THIS network before handing
+    // them to the player (prevents endless "Buffering..." on unusable URLs).
+    media = yield verifyStreams(media);
     var label = meta.names[0] + (type === "tv" ? " S" + info.season + "E" + info.episode : meta.year ? " (" + meta.year + ")" : "");
     return media.sort(function(a, b) {
+      // Probe-verified streams first: an unverified TLS-gated stream must not
+      // occupy slot #1 and stall the player before it can try working ones.
+      var va = (!a.skipProbe || a.softVerified) ? 0 : 1;
+      var vb = (!b.skipProbe || b.softVerified) ? 0 : 1;
+      if (va !== vb) return va - vb;
       return qRank(a.quality) - qRank(b.quality);
     }).map(function(x) {
       var fmt = (x.url.match(/\.(m3u8|mp4|mkv|webm|mpd)/i) || [0, ""])[1].toUpperCase();
@@ -984,7 +1382,7 @@ function getStreamsAsync(tmdbId, mediaType, season, episode) {
         title: label + (fmt ? " \u2022 " + fmt : ""),
         url: x.url,
         quality: x.quality,
-        headers: { Referer: x.referer, Origin: originOf(x.referer), "User-Agent": CONFIG.USER_AGENT },
+        headers: x.noReferer ? { "User-Agent": CONFIG.USER_AGENT } : { Referer: x.referer, Origin: originOf(x.referer), "User-Agent": CONFIG.USER_AGENT },
         provider: "myfarsi"
       };
     });
