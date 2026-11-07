@@ -53,7 +53,8 @@ var CONFIG = {
   // Per-stream reachability probe cap (ms). Probes run on-device so they reflect
   // the playback network exactly; dead/geo-locked mirrors get dropped instead of
   // leaving Nuvio buffering forever.
-  PROBE_MS: 2500,
+  PROBE_MS: 1400,
+  EXTRA_BUDGET_MS: 9000,
   USER_AGENT: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 };
 var LEARNED = {};
@@ -277,6 +278,76 @@ function slugText(u) {
   return (meaningful.join(" ") || "").replace(/\.(html?|php|aspx?)$/i, "").replace(/[-_+.]+/g, " ");
 }
 var NAV_RE = /\/(login|signin|signup|register|account|user|category|categories|tag|tags|genre|genres|contact|contact-us|privacy|dmca|terms|about|language|faq|cart|feed)(\/|\.|$|\?)|\/page\/\d+|[?&](page|lang)=/i;
+// TV builds (Android box / Fire TV) of the app run provider JS in stricter
+// engines: some expose XMLHttpRequest but NO global fetch. Without this shim
+// the provider dies on its first request and Nuvio shows no links at all.
+function xhrFetch(url, opts) {
+  return new Promise(function(resolve, reject) {
+    var XHR = typeof XMLHttpRequest !== "undefined" ? XMLHttpRequest : null;
+    if (!XHR) {
+      reject(new Error("no http bridge (no fetch, no XMLHttpRequest)"));
+      return;
+    }
+    var o = opts || {};
+    try {
+      var xhr = new XHR();
+      xhr.open((o.method || "GET").toUpperCase(), url, true);
+      try { xhr.responseType = "text"; } catch (e0) {}
+      var hs = o.headers || {};
+      for (var hk in hs) {
+        try { xhr.setRequestHeader(hk, hs[hk]); } catch (e1) {} // browsers forbid some headers (UA/Referer) — best effort
+      }
+      try { if (o.timeoutMs) xhr.timeout = o.timeoutMs; } catch (e2) {}
+      try {
+        // Honor AbortController so probe deadlines actually cancel in-flight
+        // requests on TV runtimes (no native fetch abort available there).
+        if (o.signal) {
+          if (o.signal.aborted) { try { xhr.abort(); } catch (e5) {} }
+          else if (typeof o.signal.addEventListener === "function") {
+            o.signal.addEventListener("abort", function() { try { xhr.abort(); } catch (e6) {} });
+          }
+        }
+      } catch (e7) {}
+      var done = false;
+      function finish() {
+        if (done) return;
+        done = true;
+        var status = xhr.status || 0;
+        resolve({
+          ok: status >= 200 && status < 300,
+          status: status,
+          url: xhr.responseURL || url,
+          headers: {
+            get: function(name) {
+              try {
+                var lines = (xhr.getAllResponseHeaders() || "").split(/\r?\n/);
+                for (var i = 0; i < lines.length; i++) {
+                  var c = lines[i].indexOf(":");
+                  if (c > 0 && lines[i].slice(0, c).trim().toLowerCase() === String(name).toLowerCase()) return lines[i].slice(c + 1).trim();
+                }
+              } catch (e3) {}
+              return null;
+            }
+          },
+          text: function() {
+            return Promise.resolve(typeof xhr.responseText === "string" ? xhr.responseText : "");
+          }
+        });
+      }
+      xhr.onload = finish;
+      xhr.onerror = finish;   // resolve with status 0 — callers treat as failed
+      xhr.onabort = finish;
+      xhr.ontimeout = finish;
+      xhr.send(null);
+    } catch (e4) {
+      reject(e4);
+    }
+  });
+}
+function httpFetch(url, opts) {
+  if (typeof fetch === "function") return fetch(url, opts);
+  return xhrFetch(url, opts);
+}
 function fetchTextOnce(url, ctx, referer) {
   if (ctx.fetches >= CONFIG.MAX_FETCHES) return Promise.resolve(null);
   ctx.fetches++;
@@ -294,7 +365,7 @@ function fetchTextOnce(url, ctx, referer) {
       resolve(null);
     }, CONFIG.TIMEOUT_MS);
   });
-  var req = fetch(url, { headers, signal: controller ? controller.signal : void 0 }).then(function(res) {
+  var req = httpFetch(url, { headers, signal: controller ? controller.signal : void 0, timeoutMs: CONFIG.TIMEOUT_MS }).then(function(res) {
     if (!res.ok) return null;
     return res.text().then(function(t) {
       return { text: t, url: res.url || url };
@@ -336,7 +407,7 @@ function probeStream(url, referer, useRef) {
     var og = originOf(referer);
     if (og) headers.Origin = og;
   }
-  return fetch(url, { headers, signal: controller ? controller.signal : void 0 }).then(function(res) {
+  return httpFetch(url, { headers, signal: controller ? controller.signal : void 0, timeoutMs: CONFIG.PROBE_MS + 500 }).then(function(res) {
     var ok = res.status >= 200 && res.status < 400;
     var ct = "";
     try { ct = (res.headers.get("content-type") || "").toLowerCase(); } catch (e2) {}
@@ -396,6 +467,9 @@ function cdnConstructStreams(info, ctx) {
       });
     });
   });
+  // Cap constructed candidates: dirs[0] is the real CDN shape and its padded /
+  // unpadded variants come first, so a cap cannot lose the working form.
+  if (out.length > 4) out = out.slice(0, 4);
   return out;
 }
 function farsicdnVariants(u) {
@@ -426,18 +500,28 @@ function verifyStreams(media) {
         return x;
       }
       var variants = farsicdnVariants(x.url);
-      for (var i = 0; i < variants.length; i++) {
-        var ok = yield probeStream(variants[i], x.referer, true);
-        if (!ok && x.referer) {
-          // Some CDNs (media.negahestan.com) 404 ANY request carrying a
-          // Referer — even their own site's pages. Retry bare before giving
-          // up, and remember so the player also gets Referer-free headers.
-          ok = yield probeStream(variants[i], null, false);
-          if (ok) x.noReferer = true;
-        }
-        if (ok) {
+      // Probe all variants in parallel (first ok wins by order preference).
+      // Serial failover cost ~2s per dead node on TV runtimes where the whole
+      // getStreams call must finish before the app's own timeout kills it.
+      var results = yield Promise.all(variants.map(function(v, vi) {
+        return __async(this, null, function* () {
+          var ok = yield probeStream(v, x.referer, true);
+          var noRef = false;
+          if (!ok && x.referer) {
+            // Some CDNs (media.negahestan.com) 404 ANY request carrying a
+            // Referer — even their own site's pages. Retry bare, and remember
+            // so the player also gets Referer-free headers.
+            ok = yield probeStream(v, null, false);
+            noRef = ok;
+          }
+          return { vi: vi, ok: ok, noRef: noRef };
+        });
+      }));
+      for (var i = 0; i < results.length; i++) {
+        if (results[i] && results[i].ok) {
           if (i) console.log("[probe] dead source replaced: " + x.url + " -> " + variants[i]);
           x.url = variants[i];
+          if (results[i].noRef) x.noReferer = true;
           return x;
         }
       }
@@ -1301,6 +1385,7 @@ function streamsFromSite(site, info) {
 }
 function getStreamsAsync(tmdbId, mediaType, season, episode) {
   return __async(this, null, function* () {
+    var t0 = Date.now();
     var type = mediaType === "tv" || mediaType === "series" || mediaType === "show" ? "tv" : "movie";
     var meta = yield getTitleInfo(tmdbId, type);
     if (!meta || !meta.names.length) return [];
@@ -1341,12 +1426,17 @@ function getStreamsAsync(tmdbId, mediaType, season, episode) {
     }));
     // Direct-index sources (open JSON APIs, no scraping): Dailymotion carries
     // full seasons that catalog sites geo-lock, Aparat mirrors current episodes.
-    var extras = yield Promise.all([dailymotionSource(info), aparatSource(info)].map(function(p) {
-      return p.catch(function(err) {
-        console.log("[extra source] error: " + (err && err.message ? err.message : err));
-        return [];
-      });
-    }));
+    var extras = [[], []];
+    if (Date.now() - t0 < CONFIG.EXTRA_BUDGET_MS) {
+      extras = yield Promise.all([dailymotionSource(info), aparatSource(info)].map(function(p) {
+        return p.catch(function(err) {
+          console.log("[extra source] error: " + (err && err.message ? err.message : err));
+          return [];
+        });
+      }));
+    } else {
+      console.log("[deadline] site lookups slow — skipping Dailymotion/Aparat extras");
+    }
     var media = [], unique = {};
     extras.forEach(function(list) {
       list.forEach(function(x) {
