@@ -14,7 +14,7 @@ change page layouts or URL formats. It doesn't depend on fixed selectors or URL 
      ```
      `name` is the label shown in Nuvio, and `search` is optional.
    - `TMDB_API_KEY` → free key from themoviedb.org (Settings → API)
-2. Build: `npm install` then `npm run build` → writes `providers/myfarsi.js` (what Nuvio loads)
+2. Build: `npm run build` (Node.js only; no package installation needed) → writes `providers/myfarsi.js` (what Nuvio loads)
 3. Test: `npm test` (offline, uses mock sites)
 4. Push to a public GitHub repo. In Nuvio: Settings → Plugins → Add repository:
    `https://raw.githubusercontent.com/<you>/<repo>/refs/heads/main`
@@ -51,3 +51,13 @@ Tip: a sitemap.xml on your site makes lookups faster and more reliable.
 - `providers/myfarsi.js` — built output for Nuvio (don't edit by hand)
 - `manifest.json` — repository manifest
 - `test/run-tests.js` — offline tests against three mock site layouts
+
+## Android TV compatibility
+
+The configured provider is maintained in `src/myfarsi.js` using ES5 syntax, including its async helpers. `npm run build` checks its syntax and copies it to `providers/myfarsi.js`; it does not transpile or reset configuration. Edit the source, then rebuild.
+
+On embedded hosts without `setTimeout`/`clearTimeout`, requests and stream probes rely on the host network timeout and plugin execution deadline. The optional extra-source grace period is skipped when timers are unavailable. Hosts with timers retain request cancellation and the grace period.
+
+`npm test` runs the offline scraper fixtures and Android TV compatibility regressions. These tests use mocked networking; playback and live-site availability still need checking on a device. If no source is found, the provider retains its diagnostic test clip.
+
+To distribute version 1.1.1, upload `manifest.json` and the rebuilt `providers/myfarsi.js` to your existing plugin repository, then refresh the repository in Nuvio.

@@ -133,8 +133,10 @@ async function check(name, base, args, expect) {
     (u, out) => u.length === 2 && out.every(s => s.name.startsWith('SiteA')));
   await check('Multi-site: title only on the third site is still found', ['https://site-a.test', 'https://site-b.test', 'https://site-c.test'], ['404', 'movie'],
     (u, out) => u.length === 1 && out[0].name === 'SiteC - Auto');
-  await check('Title not on site returns nothing', 'https://site-c.test', ['505', 'movie'], u => u.length === 0);
-  await check('Episode that does not exist returns nothing', 'https://site-b.test', ['303', 'tv', 1, 9], u => u.length === 0);
+  const isDiagnostic = (u, out) => u.length === 1 && out[0].name === 'DIAG - provider running (no sources found)' &&
+    u[0] === 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
+  await check('Title not on site returns the diagnostic clip', 'https://site-c.test', ['505', 'movie'], isDiagnostic);
+  await check('Episode that does not exist returns the diagnostic clip', 'https://site-b.test', ['303', 'tv', 1, 9], isDiagnostic);
 
   const p = freshProvider('https://site-c.test');
   const s = await p.getStreams('404', 'movie');

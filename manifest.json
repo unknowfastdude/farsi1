@@ -1,6 +1,6 @@
 {
   "name": "MyFarsi Providers",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Streams from my licensed Persian movie and series site",
   "author": "You",
   "scrapers": [
@@ -8,7 +8,7 @@
       "id": "myfarsi",
       "name": "MyFarsi",
       "description": "Adaptive scraper for my licensed Persian movie and series site",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "author": "You",
       "supportedTypes": ["movie", "tv"],
       "filename": "providers/myfarsi.js",
